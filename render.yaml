@@ -1,0 +1,33 @@
+services:
+  - type: web
+    name: rag-ai-backend
+    env: docker
+    region: ohio
+    plan: starter
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    envVars:
+      - key: POSTGRES_SERVER
+        fromDatabase:
+          name: rag-postgres
+          property: host
+      - key: POSTGRES_USER
+        fromDatabase:
+          name: rag-postgres
+          property: user
+      - key: POSTGRES_PASSWORD
+        fromDatabase:
+          name: rag-postgres
+          property: password
+      - key: POSTGRES_DB
+        fromDatabase:
+          name: rag-postgres
+          property: database
+      - key: OPENAI_API_KEY
+        sync: false
+
+databases:
+  - name: rag-postgres
+    region: ohio
+    plan: starter
+    # Deploy managed postgres. We'll execute CREATE EXTENSION IF NOT EXISTS vector via SQLAlchemy.
