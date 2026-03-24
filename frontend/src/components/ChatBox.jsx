@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Sparkles, Paperclip, ArrowUp, Square, Terminal, Search, Zap } from 'lucide-react';
+import { Sparkles, Paperclip, ArrowUp, Square, Terminal, Search, Zap, X, FileText } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import Message from './Message';
 
@@ -35,9 +35,22 @@ const useIntelligentScroll = (isStreaming, messages) => {
 export default function ChatBox() {
   const [messages, setMessages] = useState([]); // Empty state by default
   const [input, setInput] = useState('');
+  const [attachment, setAttachment] = useState(null);
   const [isTyping, setIsTyping] = useState(false);
   const [isRetrievingContext, setIsRetrievingContext] = useState(false);
   const textareaRef = useRef(null);
+  const fileInputRef = useRef(null);
+
+  const handleFileChange = (e) => {
+    if (e.target.files && e.target.files[0]) {
+      setAttachment(e.target.files[0]);
+    }
+  };
+
+  const removeAttachment = () => {
+    setAttachment(null);
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  };
 
   const scrollRef = useIntelligentScroll(isTyping || isRetrievingContext, messages);
 
@@ -60,17 +73,30 @@ export default function ChatBox() {
 
   const handleSubmit = async (e) => {
     if (e) e.preventDefault();
-    if (!input.trim() || isTyping || isRetrievingContext) return;
+    if ((!input.trim() && !attachment) || isTyping || isRetrievingContext) return;
 
-    const userMsg = { id: Date.now(), role: 'user', content: input.trim() };
+    const contentPrefix = attachment ? `![Attached File: ${attachment.name}]\n\n` : '';
+    const queryText = contentPrefix + input.trim();
+    const userMsg = { id: Date.now(), role: 'user', content: queryText };
     setMessages(prev => [...prev, userMsg]);
     setInput('');
+    removeAttachment();
     if (textareaRef.current) textareaRef.current.style.height = 'auto';
     
     setIsRetrievingContext(true);
     
-    // Simulate Semantic Search
-    setTimeout(() => {
+    try {
+      const response = await fetch('http://localhost:8000/chat/stream', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          query: queryText,
+          owner_id: "123e4567-e89b-12d3-a456-426614174000" // Hardcoded valid UUID for anonymous dev mode
+        })
+      });
+
+      if (!response.ok) throw new Error("Network response was not ok, is the backend running?");
+      
       setIsRetrievingContext(false);
       setIsTyping(true);
 
@@ -78,28 +104,63 @@ export default function ChatBox() {
       setMessages(prev => [...prev, { 
         id: assistantId, 
         role: 'assistant', 
-        content: '', 
+        content: '<span class="streaming-cursor"></span>', 
+        sources: [],
         model: 'GPT-4o'
       }]);
 
-      const fullContent = '**Context retrieved & synthesis applied.** \n\nThe Multimodal RAG architecture separates ingestion (vector embedding) from orchestration, allowing high-fidelity retrievals before invoking the LLM. How else can I assist?';
-      let currentLen = 0;
-      
-      const streamInterval = setInterval(() => {
-        currentLen += 4;
-        if (currentLen > fullContent.length) {
-          clearInterval(streamInterval);
-          setMessages(prev => prev.map(m => m.id === assistantId ? {...m, content: fullContent, sources: [
-            { title: "System Architecture V2", snippet: "Vector embedding orchestration allows high-fidelity lookups." },
-            { title: "RAG Docs", snippet: "pgvector HNSW indexes yield sub-millisecond retrieval." }
-          ]} : m));
-          setIsTyping(false);
-        } else {
-          setMessages(prev => prev.map(m => m.id === assistantId ? {...m, content: fullContent.substring(0, currentLen) + '<span class="streaming-cursor"></span>'} : m));
-        }
-      }, 25); 
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+      let fullContent = "";
+      let sourcesList = [];
 
-    }, 800); 
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        const chunks = decoder.decode(value, { stream: true }).split('\n\n');
+        for (const chunk of chunks) {
+          if (!chunk.startsWith('data: ')) continue;
+          const dataStr = chunk.replace('data: ', '').trim();
+          
+          if (dataStr === '[DONE]') {
+            setIsTyping(false);
+            setMessages(prev => prev.map(m => m.id === assistantId ? {...m, content: fullContent, sources: sourcesList} : m));
+            break;
+          }
+
+          try {
+            const parsed = JSON.parse(dataStr);
+            if (parsed.type === 'sources') {
+              // Convert raw db IDs to frontend card format
+              sourcesList = parsed.data.map((id, index) => ({
+                title: `pgvector chunk [${index + 1}]`,
+                snippet: `Semantic context retrieved successfully under ID: ${id}`
+              }));
+              setMessages(prev => prev.map(m => m.id === assistantId ? {...m, sources: sourcesList} : m));
+            } else if (parsed.type === 'token') {
+              fullContent += parsed.data;
+              setMessages(prev => prev.map(m => m.id === assistantId ? {...m, content: fullContent + '<span class="streaming-cursor"></span>'} : m));
+            } else if (parsed.type === 'error') {
+              fullContent += `\n\n**Error:** ${parsed.data}`;
+              setMessages(prev => prev.map(m => m.id === assistantId ? {...m, content: fullContent} : m));
+            }
+          } catch (e) {
+            // Ignore incomplete fragments
+          }
+        }
+      }
+    } catch (error) {
+      console.error("Chat Error:", error);
+      setIsRetrievingContext(false);
+      setIsTyping(false);
+      setMessages(prev => [...prev, { 
+        id: Date.now() + 2, 
+        role: 'assistant', 
+        content: '**Connection Refused.** Cannot reach the backend. Please start the backend using `uvicorn app.main:app --reload` in your terminal.', 
+        model: 'System'
+      }]);
+    }
   };
 
   return (
@@ -168,12 +229,44 @@ export default function ChatBox() {
             animate={{ y: 0, opacity: 1 }}
             transition={{ type: 'spring', stiffness: 300, damping: 25 }}
             onSubmit={handleSubmit} 
-            className="relative flex items-end gap-3 bg-surface-sidebar border border-border-light shadow-2xl rounded-2xl p-3 ring-1 ring-inset ring-transparent focus-within:ring-accent-iris/40 focus-within:border-accent-iris/40 transition-all drop-shadow-2xl"
+            className="relative flex flex-col gap-2 bg-surface-sidebar border border-border-light shadow-2xl rounded-2xl p-3 ring-1 ring-inset ring-transparent focus-within:ring-accent-iris/40 focus-within:border-accent-iris/40 transition-all drop-shadow-2xl"
           >
-            <button type="button" className="p-2.5 mb-0.5 text-text-tertiary hover:text-text-primary hover:bg-surface-hover/80 rounded-xl transition-colors shrink-0 bg-surface-base border border-border-light shadow-sm">
-              <Paperclip size={18} />
-            </button>
-            <textarea
+            {/* Attachment Preview rendering */}
+            {attachment && (
+              <div className="relative mx-1 mt-1 flex items-center gap-3 bg-surface-base border border-border-light rounded-xl p-2.5 w-max max-w-full sm:max-w-[300px] group animate-fade-in shadow-sm">
+                <div className="w-8 h-8 rounded-lg bg-accent-iris/10 flex items-center justify-center text-accent-iris shrink-0">
+                  <FileText size={16} />
+                </div>
+                <div className="flex flex-col min-w-0 pr-6">
+                  <span className="text-sm font-semibold text-text-primary truncate">{attachment.name}</span>
+                  <span className="text-[10px] text-text-tertiary uppercase tracking-wider">{(attachment.size / 1024).toFixed(1)} KB</span>
+                </div>
+                <button 
+                  type="button" 
+                  onClick={removeAttachment}
+                  className="absolute p-1 top-2 right-2 text-text-tertiary hover:text-red-400 bg-surface-hover/80 rounded-md transition-colors shadow-sm"
+                >
+                  <X size={12} strokeWidth={3} />
+                </button>
+              </div>
+            )}
+            
+            <div className="relative flex items-end gap-3 w-full">
+              <input 
+                type="file" 
+                ref={fileInputRef} 
+                onChange={handleFileChange} 
+                className="hidden" 
+                accept=".pdf,.txt,.docx,.csv"
+              />
+              <button 
+                type="button" 
+                onClick={() => fileInputRef.current?.click()}
+                className="p-2.5 mb-0.5 text-text-tertiary hover:text-text-primary hover:bg-surface-hover/80 rounded-xl transition-colors shrink-0 bg-surface-base border border-border-light shadow-sm"
+              >
+                <Paperclip size={18} />
+              </button>
+              <textarea
               ref={textareaRef}
               value={input}
               onChange={handleInput}
@@ -192,13 +285,14 @@ export default function ChatBox() {
               className={`p-2.5 mb-0.5 shrink-0 rounded-xl flex items-center justify-center transition-all duration-200 shadow-md ${
                 (isTyping || isRetrievingContext)
                 ? "bg-surface-base text-text-primary border border-border-light hover:bg-surface-hover animate-pulse" 
-                : input.trim() 
+                : (input.trim() || attachment) 
                   ? "bg-accent-iris text-white hover:bg-indigo-600 border border-transparent" 
                   : "bg-surface-base text-text-tertiary border border-border-light cursor-not-allowed"
               }`}
             >
               {(isTyping || isRetrievingContext) ? <Square fill="currentColor" size={16} /> : <ArrowUp size={18} strokeWidth={2.5} />}
             </button>
+            </div>
           </motion.form>
           <div className="text-center mt-3 text-[12px] text-text-tertiary">
             AI generated content can be inaccurate. Always verify source citations.
